@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aniruddha/npm-ebpf-monitor/internal/collector"
+	"github.com/aniruddha/npm-ebpf-monitor/internal/features"
 )
 
 // TCP state constants (match Linux kernel TCP_* values)
@@ -100,8 +101,10 @@ func main() {
 	var fileEventCount atomic.Int64
 	var tcpEventCount atomic.Int64
 	var pidMu sync.Mutex
+	var tcpAggMu sync.Mutex
 	pidCounts := make(map[uint32]int64) // pid → syscall count
 	pidComms := make(map[uint32]string) // pid → comm (from process events)
+	tcpAgg := features.NewTCPAggregator()
 
 	// Drain syscall events in a separate goroutine (high volume).
 	go func() {
@@ -139,6 +142,18 @@ func main() {
 			select {
 			case evt := <-tc.Events:
 				tcpEventCount.Add(1)
+				tcpAggMu.Lock()
+				tcpAgg.Add(features.TCPEvent{
+					Pid:         evt.Pid,
+					Saddr:       evt.Saddr,
+					Daddr:       evt.Daddr,
+					Sport:       evt.Sport,
+					Dport:       evt.Dport,
+					OldState:    evt.OldState,
+					NewState:    evt.NewState,
+					TimestampNs: evt.TimestampNs,
+				})
+				tcpAggMu.Unlock()
 				// Convert IPv4 addresses from network byte order to dotted-quad notation
 				saddr := ipv4ToString(evt.Saddr)
 				daddr := ipv4ToString(evt.Daddr)
@@ -174,7 +189,21 @@ func main() {
 			total := syscallCount.Load()
 			fileTotal := fileEventCount.Load()
 			tcpTotal := tcpEventCount.Load()
+			tcpAggMu.Lock()
+			tcpCounts := tcpAgg.Counts()
+			localIPs := sortedStringMapKeys(tcpAgg.LocalIPs)
+			remoteIPs := sortedStringMapKeys(tcpAgg.RemoteIPs)
+			localPorts := sortedUint16MapKeys(tcpAgg.LocalPorts)
+			remotePorts := sortedUint16MapKeys(tcpAgg.RemotePorts)
+			tcpAggMu.Unlock()
 			log.Printf("Done — captured %d syscall events, %d file events, and %d TCP events from tracked PIDs.", total, fileTotal, tcpTotal)
+			log.Printf("AGGREGATOR SUMMARY: StateTransitions=%d LocalIPs=%v RemoteIPs=%v LocalPorts=%v RemotePorts=%v",
+				tcpCounts.StateTransitions,
+				localIPs,
+				remoteIPs,
+				localPorts,
+				remotePorts,
+			)
 
 			// Print per-PID breakdown sorted by count descending.
 			pidMu.Lock()
@@ -213,6 +242,28 @@ func main() {
 			return
 		}
 	}
+}
+
+func sortedStringMapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k, ok := range m {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedUint16MapKeys(m map[uint16]bool) []uint16 {
+	keys := make([]uint16, 0, len(m))
+	for k, ok := range m {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
 }
 
 // ipv4ToString converts a uint32 IPv4 address in network byte order to dotted-quad notation.

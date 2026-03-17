@@ -24,7 +24,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
-// TcpEvent mirrors the C struct tcp_event from bpf/tcp_monitor.bpf.c.
+// TCPEvent mirrors the C struct tcp_event from bpf/tcp_monitor.bpf.c.
 //
 // C layout (sizeof == 32 bytes):
 //
@@ -37,7 +37,7 @@ import (
 //	__u8  new_state       → NewState    uint8    offset 17
 //	__u8  _pad[6]         → _           [6]byte  offset 18  (explicit padding)
 //	__u64 timestamp_ns    → TimestampNs uint64   offset 24
-type TcpEvent struct {
+type TCPEvent struct {
 	Pid         uint32
 	Saddr       uint32  // IPv4 source address in network byte order
 	Daddr       uint32  // IPv4 dest address in network byte order
@@ -49,17 +49,21 @@ type TcpEvent struct {
 	TimestampNs uint64
 }
 
+// TcpEvent is kept as a compatibility alias for existing callers.
+// New code should use TCPEvent.
+type TcpEvent = TCPEvent
+
 // TcpCollector attaches to tracepoint/sock/inet_sock_set_state and streams
-// decoded TcpEvent values to the Events channel.
+// decoded TCPEvent values to the Events channel.
 type TcpCollector struct {
 	objs   TcpMonitorObjects
 	link   link.Link
 	reader *ringbuf.Reader
 
-	// Events receives one TcpEvent per TCP state transition made by a tracked PID.
+	// Events receives one TCPEvent per TCP state transition made by a tracked PID.
 	// The channel is buffered (4096).  Events are dropped (not blocked) when
 	// the consumer is slower than the producer.
-	Events chan TcpEvent
+	Events chan TCPEvent
 }
 
 // NewTcpCollector loads the BPF objects (sharing tracked_pids with the
@@ -104,7 +108,7 @@ func NewTcpCollector(trackedPids *ebpf.Map) (*TcpCollector, error) {
 		objs:   objs,
 		link:   tp,
 		reader: rd,
-		Events: make(chan TcpEvent, 4096),
+		Events: make(chan TCPEvent, 4096),
 	}, nil
 }
 
@@ -127,7 +131,7 @@ func (c *TcpCollector) Run(ctx context.Context) {
 			continue
 		}
 
-		var evt TcpEvent
+		var evt TCPEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &evt); err != nil {
 			continue
 		}

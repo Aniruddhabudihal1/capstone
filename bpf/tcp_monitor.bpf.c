@@ -60,8 +60,32 @@
 #include <bpf/bpf_endian.h>
 
 /* ── well-known constants (not always visible without linux/socket.h) ─ */
-#define AF_INET     2
-#define IPPROTO_TCP 6
+#define AF_INET 2
+
+static __always_inline bool is_known_tcp_state(__u8 state)
+{
+	/*
+	 * Use TCP_* constants provided by vmlinux.h. This accepts all canonical
+	 * TCP states emitted by inet_sock_set_state and ignores unknown values.
+	 */
+	switch (state) {
+	case TCP_ESTABLISHED:
+	case TCP_SYN_SENT:
+	case TCP_SYN_RECV:
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+	case TCP_TIME_WAIT:
+	case TCP_CLOSE:
+	case TCP_CLOSE_WAIT:
+	case TCP_LAST_ACK:
+	case TCP_LISTEN:
+	case TCP_CLOSING:
+	case TCP_NEW_SYN_RECV:
+		return true;
+	default:
+		return false;
+	}
+}
 
 /* ── event structure shared with userspace ────────────────────────────
  *
@@ -156,8 +180,12 @@ SEC("tp/sock/inet_sock_set_state")
 int tracepoint__sock__inet_sock_set_state(
 	struct trace_event_raw_inet_sock_set_state *ctx)
 {
-	/* ── guard: IPv4 TCP only ─────────────────────────────────── */
-	if (ctx->family != AF_INET || ctx->protocol != IPPROTO_TCP)
+	/* ── guard: IPv4 + known TCP states only ──────────────────── */
+	if (ctx->family != AF_INET)
+		return 0;
+
+	if (!is_known_tcp_state((__u8)ctx->oldstate) ||
+	    !is_known_tcp_state((__u8)ctx->newstate))
 		return 0;
 
 	__u64 skaddr = (__u64)(uintptr_t)ctx->skaddr;
