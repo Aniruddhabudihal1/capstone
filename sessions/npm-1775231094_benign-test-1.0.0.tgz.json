@@ -1,0 +1,57 @@
+{
+  "session_id": "npm-1775231094",
+  "package_name": "benign-test-1.0.0.tgz",
+  "timestamp": "2026-04-03T21:14:58.219819945+05:30",
+  "label": null,
+  "filetop": {
+    "read_processes": 3,
+    "write_processes": 0,
+    "read_data_transfer_kb": 8,
+    "write_data_transfer_kb": 1,
+    "file_access_processes": 3
+  },
+  "install": {
+    "total_dependencies": 1,
+    "direct_dependencies": 1,
+    "indirect_dependencies": 0
+  },
+  "opensnoop": {
+    "etc_dir_access": 28,
+    "home_dir_access": 24,
+    "other_dir_access": 19,
+    "root_dir_access": 0,
+    "sys_dir_access": 19,
+    "temp_dir_access": 33,
+    "user_dir_access": 865
+  },
+  "tcp": {
+    "state_transitions": 13,
+    "local_ips": 1,
+    "remote_ips": 6,
+    "local_ports": 2,
+    "remote_ports": 1
+  },
+  "syscalls": {
+    "io_ops": 2157,
+    "file_ops": 2020,
+    "network_ops": 78,
+    "time_ops": 0,
+    "security_ops": 116,
+    "process_ops": 40,
+    "unknown_ops": 8530
+  },
+  "patterns": {
+    "p1_file_metadata": 4,
+    "p2_read_data": 0,
+    "p3_write_data": 0,
+    "p4_socket_create": 0,
+    "p5_process_create": 0,
+    "p6_memory_map": 0,
+    "p7_fd_manage": 0,
+    "p8_ipc": 0,
+    "p9_file_lock": 0,
+    "p10_error_handle": 10
+  },
+  "process_tree": "npm(279161)-\u003enpm install ben(279185)-\u003esh(279186)",
+  "timed_out": false
+}

@@ -7,6 +7,8 @@
 
 #define COMM_SIZE  16
 #define ARGS_SIZE  256
+#define ARG_SLOT_COUNT 5
+#define ARG_SLOT_SIZE  51
 
 /* ── event structure shared with userspace ────────────────────────── */
 struct process_event {
@@ -16,6 +18,7 @@ struct process_event {
     char  args[ARGS_SIZE];
     __u64 timestamp_ns;
     __u32 is_npm_related;   // 1 if comm or args contain "npm" or "node"
+    __u8  event_type;       // 0 = EXEC, 1 = FORK, 2 = EXIT
 };
 
 /* ── ring-buffer map ─────────────────────────────────────────────── */
@@ -103,6 +106,8 @@ int tracepoint__syscalls__sys_enter_execve(struct trace_event_raw_sys_enter *ctx
     if (!evt)
         return 0;
 
+    __builtin_memset(evt, 0, sizeof(*evt));
+
     /* ── PID / TGID ──────────────────────────────────────────── */
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     evt->pid = (__u32)(pid_tgid >> 32);   /* tgid == userspace PID */
@@ -118,15 +123,43 @@ int tracepoint__syscalls__sys_enter_execve(struct trace_event_raw_sys_enter *ctx
     /* ── timestamp ───────────────────────────────────────────── */
     evt->timestamp_ns = bpf_ktime_get_ns();
 
-    /* ── args: read the filename (argv[0] equivalent) ────────── *
-     * ctx->args[0] is the `filename` pointer passed to execve.
-     * We read the user-space string into evt->args.
+    /* ── args: capture argv[0:] into fixed slots inside evt->args. Slot 0
+     * contains the executable name (for example, "npm"), and userspace
+     * joins non-empty slots with spaces. Fall back to the exec filename
+     * when argv is unavailable.
      */
     const char *filename = (const char *)ctx->args[0];
-    bpf_probe_read_user_str(evt->args, sizeof(evt->args), filename);
+    const char *const *argv = (const char *const *)ctx->args[1];
+    {
+        int have_args = 0;
+
+#pragma unroll
+        for (int i = 0; i < ARG_SLOT_COUNT; i++) {
+            const char *argp = NULL;
+            const __u32 slot_offset = i * ARG_SLOT_SIZE;
+
+            if (argv == NULL)
+                break;
+
+            if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i]) < 0)
+                break;
+
+            if (argp == NULL)
+                break;
+
+            if (bpf_probe_read_user_str(evt->args + slot_offset, ARG_SLOT_SIZE, argp) <= 0)
+                break;
+            have_args = 1;
+        }
+
+        if (!have_args) {
+            bpf_probe_read_user_str(evt->args, ARG_SLOT_SIZE, filename);
+        }
+    }
 
     /* ── npm/node classification ─────────────────────────────── */
     evt->is_npm_related = check_npm_related(evt->comm, evt->args);
+    evt->event_type = 0;
 
     /* Inherit tracking from the parent process tree: if the parent is
      * already tracked (e.g. it was npm/node or a descendant), mark this
@@ -172,10 +205,29 @@ int tracepoint__sched__sched_process_fork(struct trace_event_raw_sched_process_f
 {
     __u32 parent_pid = (__u32)ctx->parent_pid;
     __u32 child_pid  = (__u32)ctx->child_pid;
+    struct process_event *evt;
 
     /* Only propagate tracking to children of already-tracked processes. */
-    if (is_tracked(parent_pid))
-        bpf_map_update_elem(&tracked_pids, &child_pid, &parent_pid, BPF_ANY);
+    if (!is_tracked(parent_pid))
+        return 0;
+
+    evt = bpf_ringbuf_reserve(&process_events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    evt->pid = child_pid;
+    evt->ppid = parent_pid;
+    evt->timestamp_ns = bpf_ktime_get_ns();
+    evt->is_npm_related = 1;
+    evt->event_type = 1;
+    bpf_probe_read_kernel_str(evt->comm, sizeof(evt->comm), ctx->child_comm);
+
+    __u32 save_child_pid = child_pid;
+    __u32 save_parent_pid = parent_pid;
+
+    bpf_ringbuf_submit(evt, 0);
+    bpf_map_update_elem(&tracked_pids, &save_child_pid, &save_parent_pid, BPF_ANY);
 
     return 0;
 }
@@ -187,9 +239,10 @@ int tracepoint__sched__sched_process_fork(struct trace_event_raw_sched_process_f
  * Filter: only act when the thread-group leader exits (pid == tgid),
  * because tracked_pids stores tgids, not individual thread ids.
  */
-SEC("tp/sched/sched_process_exit")
+SEC("tracepoint/sched/sched_process_exit")
 int tracepoint__sched__sched_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
+    struct process_event *evt;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 tid  = (__u32)pid_tgid;           /* kernel pid  (thread) */
     __u32 tgid = (__u32)(pid_tgid >> 32);   /* thread-group leader  */
@@ -198,7 +251,24 @@ int tracepoint__sched__sched_process_exit(struct trace_event_raw_sched_process_t
     if (tid != tgid)
         return 0;
 
-    bpf_map_delete_elem(&tracked_pids, &tgid);
+    if (!is_tracked(tgid))
+        return 0;
+
+    evt = bpf_ringbuf_reserve(&process_events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    evt->pid = tgid;
+    evt->timestamp_ns = bpf_ktime_get_ns();
+    evt->is_npm_related = 1;
+    evt->event_type = 2;
+    bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
+
+    __u32 save_pid = evt->pid;
+
+    bpf_ringbuf_submit(evt, 0);
+    bpf_map_delete_elem(&tracked_pids, &save_pid);
     return 0;
 }
 

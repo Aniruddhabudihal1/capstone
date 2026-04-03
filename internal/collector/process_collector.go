@@ -10,24 +10,25 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit"
 )
 
 // ProcessEvent mirrors the C struct process_event from bpf/process_tracer.bpf.c.
 //
-// C layout (sizeof == 296 bytes):
+// C layout (sizeof == 296 bytes, naturally aligned):
 //
 //	__u32 pid             →  Pid          uint32   offset   0
 //	__u32 ppid            →  Ppid         uint32   offset   4
 //	char  comm[16]        →  Comm         [16]byte offset   8
-//	char  args[256]       →  Args         [256]byte offset 24
+//	char  args[256]       →  Args         [256]byte offset  24
 //	__u64 timestamp_ns    →  TimestampNs  uint64   offset 280
 //	__u32 is_npm_related  →  IsNpmRelated uint32   offset 288
-//	(4-byte trailing pad) →  _            [4]byte  offset 292
+//	__u8  event_type      →  EventType    uint8    offset 292 (0=exec, 1=fork, 2=exit)
+//	__u8  _pad[3]         →  _            [3]byte  offset 293
 type ProcessEvent struct {
 	Pid          uint32
 	Ppid         uint32
@@ -35,10 +36,11 @@ type ProcessEvent struct {
 	Args         [256]byte
 	TimestampNs  uint64
 	IsNpmRelated uint32
-	_            [4]byte // trailing padding: C compiler pads to multiple of 8
+	EventType    uint8
+	_            [3]byte // trailing padding: C compiler pads to multiple of 8
 }
 
-// ProcessCollector attaches to the sys_enter_execve tracepoint and streams
+// ProcessCollector attaches to the process lifecycle tracepoints and streams
 // decoded ProcessEvent values to the Events channel.
 type ProcessCollector struct {
 	objs     ProcessTracerObjects
@@ -47,7 +49,7 @@ type ProcessCollector struct {
 	exitLink link.Link
 	reader   *ringbuf.Reader
 
-	// Events receives one ProcessEvent per execve syscall.
+	// Events receives one ProcessEvent per tracked exec/exit lifecycle event.
 	// The channel is buffered (1024). Events are dropped (not blocked) when
 	// the consumer is slower than the producer.
 	Events chan ProcessEvent
@@ -56,11 +58,6 @@ type ProcessCollector struct {
 // NewProcessCollector loads the BPF objects, attaches the tracepoint, and
 // opens the ring-buffer reader. The caller must call Close() when done.
 func NewProcessCollector() (*ProcessCollector, error) {
-	// Allow the current process to lock memory for BPF maps.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		return nil, fmt.Errorf("remove memlock rlimit: %w", err)
-	}
-
 	// Load pre-compiled BPF programs and maps into the kernel.
 	var objs ProcessTracerObjects
 	if err := LoadProcessTracerObjects(&objs, nil); err != nil {
@@ -164,7 +161,7 @@ func (c *ProcessCollector) Run(ctx context.Context) {
 func (c *ProcessCollector) Close() error {
 	var errs []error
 
-	if err := c.reader.Close(); err != nil {
+	if err := c.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) && !errors.Is(err, os.ErrClosed) {
 		errs = append(errs, fmt.Errorf("close ring buffer reader: %w", err))
 	}
 	if err := c.link.Close(); err != nil {

@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -28,51 +29,56 @@ import (
 type DirectoryCategory uint8
 
 const (
-	DirOther         DirectoryCategory = 0
-	DirRoot          DirectoryCategory = 1
-	DirTemp          DirectoryCategory = 2
-	DirHome          DirectoryCategory = 3
-	DirUserLib       DirectoryCategory = 4
-	DirSys           DirectoryCategory = 5
-	DirEtc           DirectoryCategory = 6
-	DirSSHAWSWallet  DirectoryCategory = 7
+	DirOther   DirectoryCategory = 0
+	DirRoot    DirectoryCategory = 1
+	DirTemp    DirectoryCategory = 2
+	DirHome    DirectoryCategory = 3
+	DirUserLib DirectoryCategory = 4
+	DirSys     DirectoryCategory = 5
+	DirEtc     DirectoryCategory = 6
 )
 
 // DirCategoryName maps category values to human-readable strings.
 var DirCategoryName = map[DirectoryCategory]string{
-	DirOther:        "OTHER",
-	DirRoot:         "ROOT",
-	DirTemp:         "TEMP",
-	DirHome:         "HOME",
-	DirUserLib:      "USER_LIB",
-	DirSys:          "SYS",
-	DirEtc:          "ETC",
-	DirSSHAWSWallet: "SSH_AWS_WALLET",
+	DirOther:   "OTHER",
+	DirRoot:    "ROOT",
+	DirTemp:    "TEMP",
+	DirHome:    "HOME",
+	DirUserLib: "USER_LIB",
+	DirSys:     "SYS",
+	DirEtc:     "ETC",
 }
 
 // FileEvent mirrors the C struct file_event from bpf/file_monitor.bpf.c.
 //
-// C layout (sizeof == 276 bytes):
+// C layout (sizeof == 280 bytes):
 //
 //	__u32 pid                → Pid          uint32              offset   0
 //	char filename[256]       → Filename     [256]byte           offset   4
 //	__u8 dir_category        → DirCategory  uint8               offset 260
+//	__u8 open_success        → OpenSuccess  uint8               offset 261
+//	__u8 pad[2]              → Pad          [2]uint8            offset 262
 //	__u32 flags              → Flags        uint32              offset 264
-//	__u64 timestamp_ns       → TimestampNs  uint64              offset 268
+//	__u64 timestamp_ns       → TimestampNs  uint64              offset 272
 type FileEvent struct {
-	Pid          uint32
-	Filename     [256]byte
-	DirCategory  uint8
-	Flags        uint32
-	TimestampNs  uint64
+	Pid         uint32
+	Filename    [256]byte
+	DirCategory uint8
+	OpenSuccess uint8
+	Pad         [2]uint8
+	Flags       uint32
+	TimestampNs uint64
 }
 
-// FileCollector attaches to tracepoint/syscalls/sys_enter_openat and streams
-// decoded FileEvent values to the Events channel.
+// FileCollector attaches to tracepoint/syscalls/sys_enter_openat and
+// tracepoint/syscalls/sys_exit_openat and streams decoded FileEvent values
+// to the Events channel.  Events are emitted at exit time so open_success
+// reflects the actual kernel return value.
 type FileCollector struct {
-	objs   FileMonitorObjects
-	link   link.Link
-	reader *ringbuf.Reader
+	objs      FileMonitorObjects
+	linkEnter link.Link
+	linkExit  link.Link
+	reader    *ringbuf.Reader
 
 	// Events receives one FileEvent per openat() call made by a tracked PID.
 	// The channel is buffered (4096).  Events are dropped (not blocked) when
@@ -100,7 +106,7 @@ func NewFileCollector(trackedPids *ebpf.Map) (*FileCollector, error) {
 	}
 
 	// Attach to tracepoint/syscalls/sys_enter_openat.
-	tp, err := link.Tracepoint(
+	tpEnter, err := link.Tracepoint(
 		"syscalls", "sys_enter_openat",
 		objs.TracepointSyscallsSysEnterOpenat,
 		nil,
@@ -110,19 +116,33 @@ func NewFileCollector(trackedPids *ebpf.Map) (*FileCollector, error) {
 		return nil, fmt.Errorf("attach tracepoint syscalls/sys_enter_openat: %w", err)
 	}
 
+	// Attach to tracepoint/syscalls/sys_exit_openat.
+	tpExit, err := link.Tracepoint(
+		"syscalls", "sys_exit_openat",
+		objs.TracepointSyscallsSysExitOpenat,
+		nil,
+	)
+	if err != nil {
+		tpEnter.Close()
+		objs.Close()
+		return nil, fmt.Errorf("attach tracepoint syscalls/sys_exit_openat: %w", err)
+	}
+
 	// Open a ring-buffer reader on the file_events map.
 	rd, err := ringbuf.NewReader(objs.FileEvents)
 	if err != nil {
-		tp.Close()
+		tpExit.Close()
+		tpEnter.Close()
 		objs.Close()
 		return nil, fmt.Errorf("open ring buffer reader: %w", err)
 	}
 
 	return &FileCollector{
-		objs:   objs,
-		link:   tp,
-		reader: rd,
-		Events: make(chan FileEvent, 4096),
+		objs:      objs,
+		linkEnter: tpEnter,
+		linkExit:  tpExit,
+		reader:    rd,
+		Events:    make(chan FileEvent, 4096),
 	}, nil
 }
 
@@ -164,16 +184,19 @@ func (c *FileCollector) TrackedPidsMap() *ebpf.Map {
 	return c.objs.TrackedPids
 }
 
-// Close detaches the tracepoint, closes the ring-buffer reader, and releases
-// all BPF resources.  Safe to call while Run is still active.
+// Close detaches both tracepoints, closes the ring-buffer reader, and
+// releases all BPF resources.  Safe to call while Run is still active.
 func (c *FileCollector) Close() error {
 	var errs []error
 
-	if err := c.reader.Close(); err != nil {
+	if err := c.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) && !errors.Is(err, os.ErrClosed) {
 		errs = append(errs, fmt.Errorf("close ring buffer reader: %w", err))
 	}
-	if err := c.link.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("close tracepoint link: %w", err))
+	if err := c.linkExit.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close tracepoint link (exit): %w", err))
+	}
+	if err := c.linkEnter.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close tracepoint link (enter): %w", err))
 	}
 	c.objs.Close()
 

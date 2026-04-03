@@ -292,4 +292,137 @@ int tracepoint__sock__inet_sock_set_state(
 	return 0;
 }
 
+/* ══ bytes_event: real-byte send/recv accounting ═════════════════════
+ *
+ * WHY kprobe here and NOT a tracepoint?
+ * ──────────────────────────────────────
+ * The kernel's tracepoint/sock namespace only publishes
+ * inet_sock_set_state.  tcp_sendmsg and tcp_recvmsg have NO stable
+ * TRACE_EVENT() definition — they are ordinary (non-inlined) exported
+ * kernel functions, but the kernel maintainers have not added a
+ * dedicated tracepoint for them.  Without a TRACE_EVENT definition
+ * there is nothing in /sys/kernel/debug/tracing/events/tcp/ to attach
+ * to for byte-level send/receive accounting.
+ *
+ * A kprobe attaches directly to the exported symbol address, which is
+ * stable across mainline kernel versions (both functions are exported
+ * via EXPORT_SYMBOL_GPL).  Because tcp_sendmsg is never inlined into
+ * callers (it is too large), the kprobe always fires.
+ *
+ * HOW PT_REGS_PARM3 works in CO-RE
+ * ──────────────────────────────────
+ * PT_REGS_PARM3(ctx) is a libbpf macro from <bpf/bpf_tracing.h>.
+ * At compile time, clang expands it to the register that the target
+ * ABI uses for the 3rd function argument:
+ *
+ *   x86-64 : rdx   (System V AMD64 ABI)
+ *   aarch64: x2    (AAPCS64)
+ *   arm32  : r2    (AAPCS)
+ *   s390x  : r4    (s390 ABI)
+ *
+ * The kernel ABI for tcp_sendmsg is:
+ *   int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+ *                    PARM1              PARM2            PARM3 ^^^
+ *
+ * CO-RE resolves the struct pt_regs field offsets at load time via
+ * the running kernel's BTF, so the same compiled .bpf.o works on any
+ * kernel that has BTF — no #ifdef per-arch guards are needed.
+ *
+ * struct bytes_event layout (12 bytes, C-packed):
+ *
+ *   offset  0  __u32 pid        4 B  — TGID of the sending/receiving process
+ *   offset  4  __u32 bytes      4 B  — byte count (clamped to u32 max)
+ *   offset  8  __u8  direction  1 B  — 0=recv, 1=send
+ *   offset  9  __u8  pad[3]     3 B  — explicit padding to 12-byte alignment
+ *                               ────
+ *   total                       12 B
+ */
+struct bytes_event {
+	__u32 pid;
+	__u32 bytes;
+	__u8  direction; /* 1=send (tcp_sendmsg), 0=recv (tcp_recvmsg) */
+	__u8  pad[3];    /* explicit pad — keeps the struct 4-byte aligned */
+};
+
+/* ── bytes_events: ring buffer → userspace ────────────────────────── */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024); /* 256 KB */
+} bytes_events SEC(".maps");
+
+/* ══ kprobe: tcp_sendmsg ═════════════════════════════════════════════
+ *
+ * Fires on entry to tcp_sendmsg in process context.
+ * The 3rd argument (size_t size) is the byte count the application
+ * asked to send; we capture it from PT_REGS_PARM3.
+ *
+ * We only emit if:
+ *   1. The current TGID is in tracked_pids.
+ *   2. size > 0 (nothing useful to report for a zero-length send).
+ */
+SEC("kprobe/tcp_sendmsg")
+int kprobe__tcp_sendmsg(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid     = (__u32)(pid_tgid >> 32);
+
+	if (!is_tracked(tgid))
+		return 0;
+
+	__u64 size = (u64)PT_REGS_PARM3(ctx);
+	if (size == 0)
+		return 0;
+
+	struct bytes_event *evt =
+		bpf_ringbuf_reserve(&bytes_events, sizeof(*evt), 0);
+	if (!evt)
+		return 0;
+
+	evt->pid       = tgid;
+	evt->bytes     = (size > (__u64)0xFFFFFFFF) ? 0xFFFFFFFF : (__u32)size;
+	evt->direction = 1; /* send */
+	__builtin_memset(evt->pad, 0, sizeof(evt->pad));
+
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
+/* ══ kretprobe: tcp_recvmsg ══════════════════════════════════════════
+ *
+ * Fires on return from tcp_recvmsg in process context.
+ * PT_REGS_RC(ctx) contains the actual bytes received (positive long),
+ * or a negative errno on failure.
+ *
+ * We only emit if:
+ *   1. The return value is > 0 (negative == error, 0 == EOF/no data).
+ *   2. The current TGID is in tracked_pids.
+ */
+SEC("kretprobe/tcp_recvmsg")
+int kretprobe__tcp_recvmsg(struct pt_regs *ctx)
+{
+	long retval = (long)PT_REGS_RC(ctx);
+	if (retval <= 0)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid     = (__u32)(pid_tgid >> 32);
+
+	if (!is_tracked(tgid))
+		return 0;
+
+	struct bytes_event *evt =
+		bpf_ringbuf_reserve(&bytes_events, sizeof(*evt), 0);
+	if (!evt)
+		return 0;
+
+	__u64 rval64 = (__u64)retval;
+	evt->pid       = tgid;
+	evt->bytes     = (rval64 > (__u64)0xFFFFFFFF) ? 0xFFFFFFFF : (__u32)rval64;
+	evt->direction = 0; /* recv */
+	__builtin_memset(evt->pad, 0, sizeof(evt->pad));
+
+	bpf_ringbuf_submit(evt, 0);
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";

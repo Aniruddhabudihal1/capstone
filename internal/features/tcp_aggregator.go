@@ -22,11 +22,11 @@ type TCPEvent struct {
 
 // TCPCounts is a compact summary of unique per-session TCP attributes.
 type TCPCounts struct {
-	StateTransitions int
-	LocalIPs         int
-	RemoteIPs        int
-	LocalPorts       int
-	RemotePorts      int
+	StateTransitions int `json:"state_transitions"`
+	LocalIPs         int `json:"local_ips"`
+	RemoteIPs        int `json:"remote_ips"`
+	LocalPorts       int `json:"local_ports"`
+	RemotePorts      int `json:"remote_ports"`
 }
 
 // TCPAggregator tracks deduplicated IP/port information for one session.

@@ -1,277 +1,319 @@
+/*
+Goroutine / data-flow layout
+
+	   kernel ring buffers
+	      |          |           |          |
+	      v          v           v          v
+	 Process     Syscall      File       TCP
+	Collector   Collector   Collector  Collector
+	   Run         Run         Run        Run
+	      \          |           |         /
+	       \         |           |        /
+	        +--------+-----------+-------+
+	                         |
+	                         v
+	                router goroutine select
+	                         |
+	                         v
+	                detector session methods
+	                         |
+	                         v
+	                detector.Completed() chan
+	                         |
+	                         v
+	                  output worker goroutine
+	                         |
+	                         v
+	                  output.JSONWriter.Write
+*/
 package main
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"sort"
+	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aniruddha/npm-ebpf-monitor/internal/collector"
 	"github.com/aniruddha/npm-ebpf-monitor/internal/features"
+	"github.com/aniruddha/npm-ebpf-monitor/internal/output"
+	"github.com/aniruddha/npm-ebpf-monitor/internal/session"
+	"github.com/cilium/ebpf/rlimit"
 )
 
-// TCP state constants (match Linux kernel TCP_* values)
-var tcpStateNames = map[uint8]string{
-	0:  "UNKNOWN",
-	1:  "ESTABLISHED",
-	2:  "SYN_SENT",
-	3:  "SYN_RECV",
-	4:  "FIN_WAIT1",
-	5:  "FIN_WAIT2",
-	6:  "TIME_WAIT",
-	7:  "CLOSE",
-	8:  "CLOSE_WAIT",
-	9:  "LAST_ACK",
-	10: "LISTEN",
-	11: "CLOSING",
-	12: "NEW_SYN_RECV",
+type closer interface {
+	Close() error
 }
 
 func main() {
-	duration := flag.Duration("duration", 90*time.Second, "how long to trace (e.g. 60s, 2m)")
+	outputDir := flag.String("output-dir", "./sessions", "directory for JSON session outputs")
+	verbose := flag.Bool("verbose", false, "enable verbose monitor logging")
+	sessionTimeout := flag.Duration("session-timeout", 120*time.Second, "maximum duration for an npm session before it is forcibly completed (0 = disable)")
+	dryRun := flag.Bool("dry-run", false, "load all BPF programs, print attachment status, and exit")
 	flag.Parse()
 
-	log.SetFlags(log.Ltime)
-	log.Println("npm-ebpf-monitor starting (requires root)")
+	log.SetFlags(log.LstdFlags)
 
-	// ── 1. Process tracer — owns the tracked_pids map ───────────────
-	pc, err := collector.NewProcessCollector()
-	if err != nil {
-		log.Fatalf("NewProcessCollector: %v", err)
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatalf("remove memlock rlimit: %v", err)
 	}
-	defer func() {
-		if err := pc.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close process collector: %v\n", err)
-		}
-	}()
 
-	// ── 2. Syscall tracer — shares tracked_pids via MapReplacements ─
-	sc, err := collector.NewSyscallCollector(pc.TrackedPidsMap())
-	if err != nil {
-		log.Fatalf("NewSyscallCollector: %v", err)
+	if *dryRun {
+		runDryRun()
+		return
 	}
-	defer func() {
-		if err := sc.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close syscall collector: %v\n", err)
-		}
-	}()
 
-	// ── 3. File monitor — shares tracked_pids via MapReplacements ────
-	fc, err := collector.NewFileCollector(pc.TrackedPidsMap())
-	if err != nil {
-		log.Fatalf("NewFileCollector: %v", err)
-	}
-	defer func() {
-		if err := fc.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close file collector: %v\n", err)
-		}
-	}()
-
-	// ── 4. TCP monitor — shares tracked_pids via MapReplacements ─────
-	tc, err := collector.NewTcpCollector(pc.TrackedPidsMap())
-	if err != nil {
-		log.Fatalf("NewTcpCollector: %v", err)
-	}
-	defer func() {
-		if err := tc.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close tcp collector: %v\n", err)
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), *duration)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go pc.Run(ctx)
-	go sc.Run(ctx)
-	go fc.Run(ctx)
-	go tc.Run(ctx)
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signalCh)
 
-	log.Printf("Tracing execve + syscalls for %s — run `npm install lodash` now...", *duration)
-	fmt.Println()
-	fmt.Printf("%-8s %-8s %-16s %s\n", "PID", "PPID", "COMM", "ARGS")
-	fmt.Println("-------- -------- ---------------- ----------------------------------------")
+	processCollector, err := collector.NewProcessCollector()
+	if err != nil {
+		log.Fatalf("load ProcessTracer: %v", err)
+	}
 
-	var syscallCount atomic.Int64
-	var fileEventCount atomic.Int64
-	var tcpEventCount atomic.Int64
-	var pidMu sync.Mutex
-	var tcpAggMu sync.Mutex
-	pidCounts := make(map[uint32]int64) // pid → syscall count
-	pidComms := make(map[uint32]string) // pid → comm (from process events)
-	tcpAgg := features.NewTCPAggregator()
+	syscallCollector, err := collector.NewSyscallCollector(processCollector.TrackedPidsMap())
+	if err != nil {
+		closeAndLog("process collector", processCollector)
+		log.Fatalf("load SyscallTracer: %v", err)
+	}
 
-	// Drain syscall events in a separate goroutine (high volume).
-	go func() {
-		for {
-			select {
-			case evt := <-sc.Events:
-				syscallCount.Add(1)
-				pidMu.Lock()
-				pidCounts[evt.Pid]++
-				pidMu.Unlock()
-			case <-ctx.Done():
-				return
-			}
+	fileCollector, err := collector.NewFileCollector(processCollector.TrackedPidsMap())
+	if err != nil {
+		closeAndLog("syscall collector", syscallCollector)
+		closeAndLog("process collector", processCollector)
+		log.Fatalf("load FileMonitor: %v", err)
+	}
+
+	tcpCollector, err := collector.NewTcpCollector(processCollector.TrackedPidsMap())
+	if err != nil {
+		closeAndLog("file collector", fileCollector)
+		closeAndLog("syscall collector", syscallCollector)
+		closeAndLog("process collector", processCollector)
+		log.Fatalf("load TCPMonitor: %v", err)
+	}
+
+	bytesCollector, err := collector.NewBytesCollector(processCollector.TrackedPidsMap())
+	if err != nil {
+		closeAndLog("tcp collector", tcpCollector)
+		closeAndLog("file collector", fileCollector)
+		closeAndLog("syscall collector", syscallCollector)
+		closeAndLog("process collector", processCollector)
+		log.Fatalf("load BytesCollector: %v", err)
+	}
+
+	detector := session.NewDetector(*sessionTimeout)
+	writer := output.NewJSONWriter(*outputDir)
+	detector.SetRootTracker(func(pid, ppid uint32) error {
+		return processCollector.TrackedPidsMap().Put(&pid, &ppid)
+	})
+	if *verbose {
+		detector.SetLogger(log.Printf)
+	}
+
+	if *verbose {
+		log.Printf("loaded process, syscall, file, and TCP collectors")
+	}
+
+	router := session.NewRouter(
+		detector,
+		processCollector.Events,
+		syscallCollector.Events,
+		fileCollector.Events,
+		tcpCollector.Events,
+		bytesCollector.Events,
+	)
+
+	var wg sync.WaitGroup
+
+	startTrackedGoroutine(&wg, func() { processCollector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { syscallCollector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { fileCollector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { tcpCollector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { bytesCollector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { detector.Run(ctx) })
+	startTrackedGoroutine(&wg, func() { router.Run(ctx) })
+	startTrackedGoroutine(&wg, func() {
+		runOutputWorker(detector, writer, *verbose)
+	})
+
+	fmt.Println("npm-ebpf-monitor active. Watching for npm install...")
+
+	<-signalCh
+	fmt.Println("Shutting down cleanly...")
+
+	cancel()
+	wg.Wait()
+
+	closeAndLog("bytes collector", bytesCollector)
+	closeAndLog("tcp collector", tcpCollector)
+	closeAndLog("file collector", fileCollector)
+	closeAndLog("syscall collector", syscallCollector)
+	closeAndLog("process collector", processCollector)
+}
+
+// probeResult holds the load outcome for a single BPF probe group.
+type probeResult struct {
+	name   string
+	attach string
+	err    error
+}
+
+// runDryRun loads each BPF collector, prints its attachment status, then exits.
+func runDryRun() {
+	var results []probeResult
+	allOK := true
+
+	addResult := func(name, attach string, err error) {
+		results = append(results, probeResult{name: name, attach: attach, err: err})
+		if err != nil {
+			allOK = false
 		}
-	}()
+	}
 
-	// Drain file events in a separate goroutine.
-	go func() {
-		for {
-			select {
-			case evt := <-fc.Events:
-				fileEventCount.Add(1)
-				filename := string(bytes.TrimRight(evt.Filename[:], "\x00"))
-				catName := collector.DirCategoryName[collector.DirectoryCategory(evt.DirCategory)]
-				log.Printf("[FILE] PID=%d path=%s category=%s", evt.Pid, filename, catName)
-			case <-ctx.Done():
-				return
-			}
+	// ProcessTracer — must be loaded first (owns the tracked_pids map).
+	processCollector, err := collector.NewProcessCollector()
+	addResult("ProcessTracer",
+		"tracepoint/syscalls/sys_enter_execve, sched_process_fork, sched_process_exit",
+		err)
+	if err != nil {
+		// Remaining collectors need the tracked_pids map — skip them.
+		printDryRunResults(results)
+		printKernelInfo()
+		exitDryRun(allOK)
+	}
+	defer closeAndLog("process collector", processCollector)
+
+	syscallCollector, err := collector.NewSyscallCollector(processCollector.TrackedPidsMap())
+	addResult("SyscallTracer", "tracepoint/raw_syscalls/sys_enter", err)
+	if err == nil {
+		defer closeAndLog("syscall collector", syscallCollector)
+	}
+
+	fileCollector, err := collector.NewFileCollector(processCollector.TrackedPidsMap())
+	addResult("FileMonitor", "tracepoint/syscalls/sys_enter_openat, sys_exit_openat", err)
+	if err == nil {
+		defer closeAndLog("file collector", fileCollector)
+	}
+
+	tcpCollector, err := collector.NewTcpCollector(processCollector.TrackedPidsMap())
+	addResult("TCPMonitor", "tracepoint/sock/inet_sock_set_state", err)
+	if err == nil {
+		defer closeAndLog("tcp collector", tcpCollector)
+	}
+
+	bytesCollector, err := collector.NewBytesCollector(processCollector.TrackedPidsMap())
+	addResult("BytesCollector", "kprobe/tcp_sendmsg, kretprobe/tcp_recvmsg", err)
+	if err == nil {
+		defer closeAndLog("bytes collector", bytesCollector)
+	}
+
+	printDryRunResults(results)
+	printKernelInfo()
+	exitDryRun(allOK)
+}
+
+func printDryRunResults(results []probeResult) {
+	for _, r := range results {
+		mark := "✓"
+		if r.err != nil {
+			mark = "✗"
 		}
-	}()
-
-	// Drain TCP events in a separate goroutine.
-	go func() {
-		for {
-			select {
-			case evt := <-tc.Events:
-				tcpEventCount.Add(1)
-				tcpAggMu.Lock()
-				tcpAgg.Add(features.TCPEvent{
-					Pid:         evt.Pid,
-					Saddr:       evt.Saddr,
-					Daddr:       evt.Daddr,
-					Sport:       evt.Sport,
-					Dport:       evt.Dport,
-					OldState:    evt.OldState,
-					NewState:    evt.NewState,
-					TimestampNs: evt.TimestampNs,
-				})
-				tcpAggMu.Unlock()
-				// Convert IPv4 addresses from network byte order to dotted-quad notation
-				saddr := ipv4ToString(evt.Saddr)
-				daddr := ipv4ToString(evt.Daddr)
-				oldStateName := tcpStateNames[evt.OldState]
-				newStateName := tcpStateNames[evt.NewState]
-				log.Printf("[TCP] PID=%-6d %s:%-5d → %s:%-5d  %s → %s",
-					evt.Pid, saddr, evt.Sport, daddr, evt.Dport,
-					oldStateName, newStateName)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Print process events in the main goroutine.
-	for {
-		select {
-		case evt := <-pc.Events:
-			comm := string(bytes.TrimRight(evt.Comm[:], "\x00"))
-			args := string(bytes.TrimRight(evt.Args[:], "\x00"))
-			npmTag := ""
-			if evt.IsNpmRelated == 1 {
-				npmTag = "  *** npm/node ***"
-				pidMu.Lock()
-				if _, seen := pidComms[evt.Pid]; !seen {
-					pidComms[evt.Pid] = comm
-				}
-				pidMu.Unlock()
-			}
-			fmt.Printf("%-8d %-8d %-16s %s%s\n",
-				evt.Pid, evt.Ppid, comm, args, npmTag)
-		case <-ctx.Done():
-			total := syscallCount.Load()
-			fileTotal := fileEventCount.Load()
-			tcpTotal := tcpEventCount.Load()
-			tcpAggMu.Lock()
-			tcpCounts := tcpAgg.Counts()
-			localIPs := sortedStringMapKeys(tcpAgg.LocalIPs)
-			remoteIPs := sortedStringMapKeys(tcpAgg.RemoteIPs)
-			localPorts := sortedUint16MapKeys(tcpAgg.LocalPorts)
-			remotePorts := sortedUint16MapKeys(tcpAgg.RemotePorts)
-			tcpAggMu.Unlock()
-			log.Printf("Done — captured %d syscall events, %d file events, and %d TCP events from tracked PIDs.", total, fileTotal, tcpTotal)
-			log.Printf("AGGREGATOR SUMMARY: StateTransitions=%d LocalIPs=%v RemoteIPs=%v LocalPorts=%v RemotePorts=%v",
-				tcpCounts.StateTransitions,
-				localIPs,
-				remoteIPs,
-				localPorts,
-				remotePorts,
-			)
-
-			// Print per-PID breakdown sorted by count descending.
-			pidMu.Lock()
-			type pidRow struct {
-				pid   uint32
-				comm  string
-				count int64
-			}
-			var rows []pidRow
-			for pid, cnt := range pidCounts {
-				comm := pidComms[pid]
-				if comm == "" {
-					comm = "(unknown)"
-				}
-				rows = append(rows, pidRow{pid, comm, cnt})
-			}
-			pidMu.Unlock()
-			sort.Slice(rows, func(i, j int) bool { return rows[i].count > rows[j].count })
-
-			if len(rows) > 0 {
-				fmt.Println()
-				fmt.Printf("%-8s %-16s %s\n", "PID", "COMM", "SYSCALLS")
-				fmt.Println("-------- ---------------- ----------")
-				for _, r := range rows {
-					fmt.Printf("%-8d %-16s %d\n", r.pid, r.comm, r.count)
-				}
-				fmt.Println()
-			}
-
-			// PASS/FAIL verdict
-			if total >= 1000 {
-				log.Printf("✅ PASS — %d syscall events (≥1000 threshold met)", total)
-			} else {
-				log.Printf("❌ FAIL — only %d syscall events captured (want ≥1000)", total)
-			}
-			return
+		fmt.Printf("  %s %-18s → %s\n", mark, r.name, r.attach)
+		if r.err != nil {
+			fmt.Printf("      error: %v\n", r.err)
 		}
 	}
 }
 
-func sortedStringMapKeys(m map[string]bool) []string {
-	keys := make([]string, 0, len(m))
-	for k, ok := range m {
-		if ok {
-			keys = append(keys, k)
+func printKernelInfo() {
+	kernelVersion := "unknown"
+	if data, err := os.ReadFile("/proc/version"); err == nil {
+		line := strings.TrimSpace(string(data))
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			kernelVersion = strings.Join(fields[:3], " ")
 		}
 	}
-	sort.Strings(keys)
-	return keys
+
+	btfStatus := "not supported"
+	if _, err := os.Stat("/sys/kernel/btf/vmlinux"); err == nil {
+		btfStatus = "supported"
+	}
+	coreStatus := btfStatus // CO-RE requires BTF
+
+	fmt.Printf("  Kernel: %-30s   BTF: %-14s   CO-RE: %s\n",
+		kernelVersion, btfStatus, coreStatus)
 }
 
-func sortedUint16MapKeys(m map[uint16]bool) []uint16 {
-	keys := make([]uint16, 0, len(m))
-	for k, ok := range m {
-		if ok {
-			keys = append(keys, k)
+func exitDryRun(allOK bool) {
+	if allOK {
+		fmt.Println("  All probes loaded successfully.")
+		os.Exit(0)
+	}
+	fmt.Println("  One or more probes failed to load.")
+	os.Exit(1)
+}
+
+func startTrackedGoroutine(wg *sync.WaitGroup, fn func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fn()
+	}()
+}
+
+func runOutputWorker(detector *session.Detector, writer *output.JSONWriter, verbose bool) {
+	for completed := range detector.Completed() {
+		installFeatures, err := loadInstallFeatures(completed)
+		if err != nil {
+			log.Printf("extract install features for session %s: %v", completed.ID, err)
+		} else if verbose && completed.Cwd == "" {
+			log.Printf("session %s has no cwd; install metadata unavailable", completed.ID)
+		}
+
+		record := output.BuildRecord(completed, installFeatures)
+		for _, warning := range output.Validate(record) {
+			log.Printf("%s", warning)
+		}
+
+		path, err := writer.Write(record)
+		if err != nil {
+			log.Printf("write session %s: %v", completed.ID, err)
+			continue
+		}
+
+		if verbose {
+			log.Printf("wrote session record: %s", path)
 		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	return keys
 }
 
-// ipv4ToString converts a uint32 IPv4 address in network byte order to dotted-quad notation.
-// Network byte order is big-endian, so byte 0 (LSB) is the first octet.
-func ipv4ToString(addr uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(addr),
-		byte(addr>>8),
-		byte(addr>>16),
-		byte(addr>>24))
+func loadInstallFeatures(sess *session.Session) (features.InstallFeatures, error) {
+	if sess == nil || sess.Cwd == "" {
+		return features.InstallFeatures{}, nil
+	}
+
+	return features.ExtractInstallFeatures(filepath.Join(sess.Cwd, "package-lock.json"))
+}
+
+func closeAndLog(name string, resource closer) {
+	if resource == nil {
+		return
+	}
+
+	if err := resource.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		log.Printf("close %s: %v", name, err)
+	}
 }

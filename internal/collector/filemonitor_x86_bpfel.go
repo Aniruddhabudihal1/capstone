@@ -12,6 +12,12 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type FileMonitorPendingOpen struct {
+	Pid         uint32
+	DirCategory uint8
+	Pad         [3]uint8
+}
+
 // LoadFileMonitor returns the embedded CollectionSpec for FileMonitor.
 func LoadFileMonitor() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_FileMonitorBytes)
@@ -54,14 +60,16 @@ type FileMonitorSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type FileMonitorProgramSpecs struct {
 	TracepointSyscallsSysEnterOpenat *ebpf.ProgramSpec `ebpf:"tracepoint__syscalls__sys_enter_openat"`
+	TracepointSyscallsSysExitOpenat  *ebpf.ProgramSpec `ebpf:"tracepoint__syscalls__sys_exit_openat"`
 }
 
 // FileMonitorMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type FileMonitorMapSpecs struct {
-	FileEvents  *ebpf.MapSpec `ebpf:"file_events"`
-	TrackedPids *ebpf.MapSpec `ebpf:"tracked_pids"`
+	FileEvents   *ebpf.MapSpec `ebpf:"file_events"`
+	PendingOpens *ebpf.MapSpec `ebpf:"pending_opens"`
+	TrackedPids  *ebpf.MapSpec `ebpf:"tracked_pids"`
 }
 
 // FileMonitorObjects contains all objects after they have been loaded into the kernel.
@@ -83,13 +91,15 @@ func (o *FileMonitorObjects) Close() error {
 //
 // It can be passed to LoadFileMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type FileMonitorMaps struct {
-	FileEvents  *ebpf.Map `ebpf:"file_events"`
-	TrackedPids *ebpf.Map `ebpf:"tracked_pids"`
+	FileEvents   *ebpf.Map `ebpf:"file_events"`
+	PendingOpens *ebpf.Map `ebpf:"pending_opens"`
+	TrackedPids  *ebpf.Map `ebpf:"tracked_pids"`
 }
 
 func (m *FileMonitorMaps) Close() error {
 	return _FileMonitorClose(
 		m.FileEvents,
+		m.PendingOpens,
 		m.TrackedPids,
 	)
 }
@@ -99,11 +109,13 @@ func (m *FileMonitorMaps) Close() error {
 // It can be passed to LoadFileMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type FileMonitorPrograms struct {
 	TracepointSyscallsSysEnterOpenat *ebpf.Program `ebpf:"tracepoint__syscalls__sys_enter_openat"`
+	TracepointSyscallsSysExitOpenat  *ebpf.Program `ebpf:"tracepoint__syscalls__sys_exit_openat"`
 }
 
 func (p *FileMonitorPrograms) Close() error {
 	return _FileMonitorClose(
 		p.TracepointSyscallsSysEnterOpenat,
+		p.TracepointSyscallsSysExitOpenat,
 	)
 }
 

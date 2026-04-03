@@ -8,17 +8,19 @@ import (
 // TestDirCounterToMap simulates a realistic npm install trace:
 //   - a handful of /usr/lib reads (node_modules linking)
 //   - several /home reads (npm cache)
-//   - two .ssh / .aws hits (credential-file reads that must be flagged)
 //   - a /tmp write (npm's temp staging area)
 //   - a /etc read (e.g. /etc/resolv.conf)
 //   - a /sys probe (rare but present)
 //   - an unknown category (must land in Other)
 //
+// Note: .ssh / .aws paths are now classified as DIR_OTHER by the BPF
+// layer and therefore contribute to other_dir_access, not a separate
+// ssh_aws_wallet_access field.
+//
 // Key invariants verified:
-//  1. home_dir_access == Home + SshAwsWallet  (folded for QUT-DV25 vector)
-//  2. ssh_aws_wallet_access == SshAwsWallet   (kept separate for alerting)
-//  3. Every other counter maps 1-to-1 to its field value.
-//  4. ToMap() emits exactly the expected set of keys (no extras, no missing).
+//  1. home_dir_access == Home (1-to-1 mapping; no merging needed).
+//  2. Every other counter maps 1-to-1 to its field value.
+//  3. ToMap() emits exactly the expected set of keys (no extras, no missing).
 func TestDirCounterToMap(t *testing.T) {
 	dc := DirCounts{}
 
@@ -33,11 +35,6 @@ func TestDirCounterToMap(t *testing.T) {
 	dc.Add(dirHome) // 1
 	dc.Add(dirHome) // 2
 	dc.Add(dirHome) // 3
-
-	// Sensitive credential reads — must increment both SshAwsWallet and
-	// ultimately be reflected in home_dir_access.
-	dc.Add(dirSSHAWSWallet) // 1
-	dc.Add(dirSSHAWSWallet) // 2
 
 	// /tmp staging
 	dc.Add(dirTemp) // 1
@@ -57,14 +54,13 @@ func TestDirCounterToMap(t *testing.T) {
 	dc.Add(255)      // 2  — unrecognised value → default branch
 
 	want := map[string]int{
-		"root_dir_access":       1,
-		"temp_dir_access":       2,
-		"home_dir_access":       5, // 3 home + 2 ssh_aws_wallet
-		"user_dir_access":       5,
-		"sys_dir_access":        1,
-		"etc_dir_access":        1,
-		"other_dir_access":      2,
-		"ssh_aws_wallet_access": 2,
+		"root_dir_access":  1,
+		"temp_dir_access":  2,
+		"home_dir_access":  3,
+		"user_dir_access":  5,
+		"sys_dir_access":   1,
+		"etc_dir_access":   1,
+		"other_dir_access": 2,
 	}
 
 	got := dc.ToMap()
@@ -86,13 +82,9 @@ func TestDirCounterToMap(t *testing.T) {
 		}
 	}
 
-	// Explicitly confirm the ssh_aws_wallet folding invariant so a future
-	// refactor cannot silently break it.
-	if got["home_dir_access"] != got["ssh_aws_wallet_access"]+dc.Home {
-		t.Errorf(
-			"home_dir_access (%d) != Home (%d) + ssh_aws_wallet_access (%d)",
-			got["home_dir_access"], dc.Home, got["ssh_aws_wallet_access"],
-		)
+	// Confirm no ssh_aws_wallet_access key is emitted (would break QUT-DV25).
+	if _, has := got["ssh_aws_wallet_access"]; has {
+		t.Error("ToMap() must NOT emit ssh_aws_wallet_access (breaks 36-feature schema)")
 	}
 }
 
@@ -110,7 +102,6 @@ func TestDirCounterToMap_Empty(t *testing.T) {
 		"sys_dir_access",
 		"etc_dir_access",
 		"other_dir_access",
-		"ssh_aws_wallet_access",
 	}
 
 	if len(got) != len(expectedKeys) {
@@ -141,9 +132,6 @@ func TestDirCounterAdd_AllCategories(t *testing.T) {
 		{"sys", dirSys, "sys_dir_access"},
 		{"etc", dirEtc, "etc_dir_access"},
 		{"other", dirOther, "other_dir_access"},
-		// SSH_AWS_WALLET must bump both home_dir_access and ssh_aws_wallet_access.
-		{"sshAwsWallet/home", dirSSHAWSWallet, "home_dir_access"},
-		{"sshAwsWallet/sensitive", dirSSHAWSWallet, "ssh_aws_wallet_access"},
 	}
 
 	for _, tt := range tests {
@@ -164,7 +152,7 @@ func TestDirCounterAdd_AllCategories(t *testing.T) {
 // defined in bpf/file_monitor.bpf.c falls through to other_dir_access rather
 // than silently discarding the event.
 func TestDirCounterAdd_UnknownCategory(t *testing.T) {
-	unknownValues := []uint8{8, 50, 127, 200, 255}
+	unknownValues := []uint8{7, 8, 50, 127, 200, 255}
 
 	for _, v := range unknownValues {
 		dc := DirCounts{}

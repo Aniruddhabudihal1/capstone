@@ -53,6 +53,8 @@ type TcpMonitorSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcpMonitorProgramSpecs struct {
+	KprobeTcpSendmsg               *ebpf.ProgramSpec `ebpf:"kprobe__tcp_sendmsg"`
+	KretprobeTcpRecvmsg            *ebpf.ProgramSpec `ebpf:"kretprobe__tcp_recvmsg"`
 	TracepointSockInetSockSetState *ebpf.ProgramSpec `ebpf:"tracepoint__sock__inet_sock_set_state"`
 }
 
@@ -60,6 +62,7 @@ type TcpMonitorProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TcpMonitorMapSpecs struct {
+	BytesEvents *ebpf.MapSpec `ebpf:"bytes_events"`
 	SockToPid   *ebpf.MapSpec `ebpf:"sock_to_pid"`
 	TcpEvents   *ebpf.MapSpec `ebpf:"tcp_events"`
 	TrackedPids *ebpf.MapSpec `ebpf:"tracked_pids"`
@@ -84,6 +87,7 @@ func (o *TcpMonitorObjects) Close() error {
 //
 // It can be passed to LoadTcpMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcpMonitorMaps struct {
+	BytesEvents *ebpf.Map `ebpf:"bytes_events"`
 	SockToPid   *ebpf.Map `ebpf:"sock_to_pid"`
 	TcpEvents   *ebpf.Map `ebpf:"tcp_events"`
 	TrackedPids *ebpf.Map `ebpf:"tracked_pids"`
@@ -91,6 +95,7 @@ type TcpMonitorMaps struct {
 
 func (m *TcpMonitorMaps) Close() error {
 	return _TcpMonitorClose(
+		m.BytesEvents,
 		m.SockToPid,
 		m.TcpEvents,
 		m.TrackedPids,
@@ -101,11 +106,15 @@ func (m *TcpMonitorMaps) Close() error {
 //
 // It can be passed to LoadTcpMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TcpMonitorPrograms struct {
+	KprobeTcpSendmsg               *ebpf.Program `ebpf:"kprobe__tcp_sendmsg"`
+	KretprobeTcpRecvmsg            *ebpf.Program `ebpf:"kretprobe__tcp_recvmsg"`
 	TracepointSockInetSockSetState *ebpf.Program `ebpf:"tracepoint__sock__inet_sock_set_state"`
 }
 
 func (p *TcpMonitorPrograms) Close() error {
 	return _TcpMonitorClose(
+		p.KprobeTcpSendmsg,
+		p.KretprobeTcpRecvmsg,
 		p.TracepointSockInetSockSetState,
 	)
 }

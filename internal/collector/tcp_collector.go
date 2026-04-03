@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -165,7 +166,7 @@ func (c *TcpCollector) SockToPidMap() *ebpf.Map {
 func (c *TcpCollector) Close() error {
 	var errs []error
 
-	if err := c.reader.Close(); err != nil {
+	if err := c.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) && !errors.Is(err, os.ErrClosed) {
 		errs = append(errs, fmt.Errorf("close ring buffer reader: %w", err))
 	}
 	if err := c.link.Close(); err != nil {

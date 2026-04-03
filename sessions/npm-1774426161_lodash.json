@@ -1,0 +1,57 @@
+{
+  "session_id": "npm-1774426161",
+  "package_name": "lodash",
+  "timestamp": "2026-03-25T13:39:22.980242339+05:30",
+  "label": null,
+  "filetop": {
+    "read_processes": 1,
+    "write_processes": 0,
+    "read_data_transfer_kb": 0,
+    "write_data_transfer_kb": 0,
+    "file_access_processes": 1
+  },
+  "install": {
+    "total_dependencies": 1,
+    "direct_dependencies": 1,
+    "indirect_dependencies": 0
+  },
+  "opensnoop": {
+    "etc_dir_access": 14,
+    "home_dir_access": 9,
+    "other_dir_access": 10,
+    "root_dir_access": 0,
+    "ssh_aws_wallet_access": 0,
+    "sys_dir_access": 12,
+    "temp_dir_access": 12,
+    "user_dir_access": 865
+  },
+  "tcp": {
+    "StateTransitions": 2,
+    "LocalIPs": 1,
+    "RemoteIPs": 1,
+    "LocalPorts": 2,
+    "RemotePorts": 1
+  },
+  "syscalls": {
+    "io_ops": 1951,
+    "file_ops": 1774,
+    "network_ops": 43,
+    "time_ops": 0,
+    "security_ops": 51,
+    "process_ops": 13,
+    "unknown_ops": 7006
+  },
+  "patterns": {
+    "p1_file_metadata": 2,
+    "p2_read_data": 0,
+    "p3_write_data": 0,
+    "p4_socket_create": 0,
+    "p5_process_create": 0,
+    "p6_memory_map": 0,
+    "p7_fd_manage": 0,
+    "p8_ipc": 0,
+    "p9_file_lock": 0,
+    "p10_error_handle": 5
+  },
+  "process_tree": "npm(929404)"
+}

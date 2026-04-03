@@ -8,33 +8,26 @@ package features
 // They are duplicated here (unexported) to keep the dependency graph clean:
 // the features layer must not import the collector layer.
 const (
-	dirOther        uint8 = 0
-	dirRoot         uint8 = 1
-	dirTemp         uint8 = 2
-	dirHome         uint8 = 3
-	dirUserLib      uint8 = 4
-	dirSys          uint8 = 5
-	dirEtc          uint8 = 6
-	dirSSHAWSWallet uint8 = 7
+	dirOther   uint8 = 0
+	dirRoot    uint8 = 1
+	dirTemp    uint8 = 2
+	dirHome    uint8 = 3
+	dirUserLib uint8 = 4
+	dirSys     uint8 = 5
+	dirEtc     uint8 = 6
 )
 
 // DirCounts accumulates directory-access counts for a single npm-install
 // session.  Each field corresponds to one of the DIR_* categories emitted
 // by the file_monitor BPF program.
-//
-// SshAwsWallet is stored separately from Home so that the alerting layer can
-// distinguish a routine home-directory read from a credential-related one,
-// while ToMap() still rolls both into "home_dir_access" for the QUT-DV25
-// feature vector.
 type DirCounts struct {
-	Root         int
-	Temp         int
-	Home         int
-	UserLib      int
-	Sys          int
-	Etc          int
-	SshAwsWallet int
-	Other        int
+	Root    int
+	Temp    int
+	Home    int
+	UserLib int
+	Sys     int
+	Etc     int
+	Other   int
 }
 
 // Add increments the counter that corresponds to category.
@@ -54,8 +47,6 @@ func (dc *DirCounts) Add(category uint8) {
 		dc.Sys++
 	case dirEtc:
 		dc.Etc++
-	case dirSSHAWSWallet:
-		dc.SshAwsWallet++
 	default: // dirOther (0) and any future/unknown value
 		dc.Other++
 	}
@@ -63,19 +54,17 @@ func (dc *DirCounts) Add(category uint8) {
 
 // ToMap returns a map keyed by QUT-DV25 feature names.
 //
-// SSH/AWS/Wallet paths live inside the home directory tree, so their count is
-// folded into "home_dir_access".  They are also emitted as the separate key
-// "ssh_aws_wallet_access" so that downstream alerting logic can flag
-// credential-file access without reprocessing the raw events.
+// There are exactly 7 directory-access features.  .ssh/.aws paths are
+// classified as DIR_OTHER by the BPF layer so that the ML model sees
+// exactly the 36 features required by QUT-DV25.
 func (dc *DirCounts) ToMap() map[string]int {
 	return map[string]int{
-		"root_dir_access":       dc.Root,
-		"temp_dir_access":       dc.Temp,
-		"home_dir_access":       dc.Home + dc.SshAwsWallet,
-		"user_dir_access":       dc.UserLib,
-		"sys_dir_access":        dc.Sys,
-		"etc_dir_access":        dc.Etc,
-		"other_dir_access":      dc.Other,
-		"ssh_aws_wallet_access": dc.SshAwsWallet,
+		"root_dir_access":  dc.Root,
+		"temp_dir_access":  dc.Temp,
+		"home_dir_access":  dc.Home,
+		"user_dir_access":  dc.UserLib,
+		"sys_dir_access":   dc.Sys,
+		"etc_dir_access":   dc.Etc,
+		"other_dir_access": dc.Other,
 	}
 }
